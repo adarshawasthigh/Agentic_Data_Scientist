@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 from typing import Annotated, TypedDict, Literal
 
 # LangGraph & LangChain
-from langgraph.graph import StateGraph
+from langgraph.graph import StateGraph , START,END
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.types import interrupt, Command
@@ -112,6 +112,7 @@ with st.sidebar:
         st.success(f"File Uploaded: {uploaded_file.name}")
 
 # --- AGENT LOGIC ---
+
 def local_executor(code):
     """Executes Python code in a restricted/sanitized environment."""
     old_out = sys.stdout
@@ -166,7 +167,14 @@ def local_executor(code):
 class State(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
 
-def node(state: State):
+# --- NODE 1: THE AGENT (THINKER) ---
+def agent_node(state: State):
+    """
+    Responsibilities:
+    1. Check API Key.
+    2. Contextualize (System Prompt).
+    3. Generate the next message (Text or Code).
+    """
     if "GOOGLE_API_KEY" not in os.environ: 
         return {"messages": [AIMessage("Please provide a Gemini API Key in the sidebar.")]}
     
@@ -181,53 +189,90 @@ def node(state: State):
     5. If the user asks to plot, use matplotlib.pyplot.
     """)
     
-    # Combine System Msg + History
+    # Invoke LLM
     response = llm.invoke([sys_msg] + state["messages"])
-    
-    # Code Execution Check
-    if "```python" in response.content:
-        code_match = re.search(r"```python\n(.*?)```", response.content, re.DOTALL)
-        if code_match:
-            code = code_match.group(1)
-            
-            # Human-in-the-loop for Training
-            if any(x in code for x in [".fit", "joblib.dump", "RandomForest", "sklearn"]):
-                decision = interrupt({"question": "Approve training code?", "code": code})
-                if str(decision).lower() not in ["yes", "approve"]: 
-                    return {"messages": [response, HumanMessage("Action Blocked by User.")]}
-            
-            # Execute Code
-            text_out, plot_out = local_executor(code)
-            
-            # Handle Plot (Store in session state to render later)
-            if plot_out:
-                st.session_state["last_plot"] = plot_out
-                return {"messages": [response, HumanMessage(f"Code Executed. Output: {text_out}\n[System: A plot was generated]")]}
-            
-            return {"messages": [response, HumanMessage(f"Code Executed. Output: {text_out}")]}
-    
-    # Permission Check (Text based)
-    if "permission" in response.content.lower():
-        decision = interrupt({"question": response.content})
-        return {"messages": [response, HumanMessage(f"User Decision: {decision}")]}
-    
     return {"messages": [response]}
+
+# --- NODE 2: THE TOOL (DOER) ---
+def tool_node(state: State):
+    """
+    Responsibilities:
+    1. Extract code from the last AIMessage.
+    2. Check Safety/Interrupts (HITL).
+    3. Execute code.
+    4. Return Output.
+    """
+    last_message = state["messages"][-1]
+    content = last_message.content
+    
+    # 1. Extract Code
+    code_match = re.search(r"```python\n(.*?)```", content, re.DOTALL)
+    if not code_match:
+        return {"messages": [HumanMessage(content="Error: No code block found to execute.")]}
+    
+    code = code_match.group(1)
+
+    # 2. Safety Check (Human-in-the-loop)
+    # We interrupt strictly inside the Tool Node before execution
+    if any(x in code for x in [".fit", "joblib.dump", "RandomForest", "sklearn"]):
+        # This pauses the graph. The user must provide a value via Command(resume="...")
+        decision = interrupt({"question": "Approve training code?", "code": code})
+        
+        # Validate decision
+        if str(decision).lower() not in ["yes", "approve"]: 
+            return {"messages": [HumanMessage(content=f"Action Blocked by User. Decision: {decision}")]}
+
+    # 3. Execution
+    text_out, plot_out = local_executor(code)
+    
+    # 4. Handle Plot Side-effect
+    if plot_out:
+        st.session_state["last_plot"] = plot_out
+        return {"messages": [HumanMessage(content=f"Code Executed. Output: {text_out}\n[System: A plot was generated]")]}
+            
+    return {"messages": [HumanMessage(content=f"Code Executed. Output: {text_out}")]}
+
+# --- CONDITIONAL LOGIC (ROUTER) ---
+def should_continue(state: State) -> Literal["tools", "__end__"]:
+    """
+    Determines if we need to run tools or stop.
+    """
+    last_message = state["messages"][-1]
+    
+    # If the agent generated a Python block, go to tools
+    if "```python" in last_message.content:
+        return "tools"
+    
+    # Otherwise, stop and wait for user input
+    return "__end__"
 
 # --- GRAPH BUILD ---
 if "graph" not in st.session_state:
     workflow = StateGraph(State)
-    workflow.add_node("agent", node)
+    
+    # Add Nodes
+    workflow.add_node("agent", agent_node)
+    workflow.add_node("tools", tool_node)
+    
+    # Set Entry Point
     workflow.set_entry_point("agent")
     
-    # Loop back to agent if the last message was a tool output (HumanMessage acting as tool output)
-    # End if the last message was an Assistant message (waiting for user input)
+    # Add Edges
+    # 1. From Agent, decide where to go (Tool or End)
+    # THE CORRECT CODE
     workflow.add_conditional_edges(
-        "agent", 
-        lambda s: "agent" if isinstance(s["messages"][-1], HumanMessage) else "__end__"
+        "agent",           # 1. Start at 'agent' node
+        should_continue,   # 2. Run this function to get a string output
+        {                  # 3. Map the string output to the next node
+            "tools": "tools",
+            "__end__": END
+        }
     )
     
+    # 2. From Tool, always go back to Agent (to interpret results)
+    workflow.add_edge("tools", "agent")
+    
     st.session_state["graph"] = workflow.compile(checkpointer=MemorySaver())
-
 app = st.session_state["graph"]
 config = {"configurable": {"thread_id": st.session_state["session_id"]}}
 
