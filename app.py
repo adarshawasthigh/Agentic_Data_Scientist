@@ -112,29 +112,52 @@ with st.sidebar:
         st.success(f"File Uploaded: {uploaded_file.name}")
 
 # --- AGENT LOGIC ---
-
 def local_executor(code):
-    """Executes Python code and captures both text output and matplotlib plots."""
+    """Executes Python code in a restricted/sanitized environment."""
     old_out = sys.stdout
     new_out = io.StringIO()
     sys.stdout = new_out
-    
-    # Ensure agent_globals exists
+
+    # ---1. SECURITY FIX START ---
     if "agent_globals" not in st.session_state:
-        st.session_state["agent_globals"] = globals().copy()
-    
-    plot_buf = None
+        # 1. Create a whitelist of safe libraries
+        safe_globals = {
+            "pd": pd,
+            "plt": plt,
+            "io": io,
+            "np": __import__("numpy"),
+            "re": re,
+            "math": __import__("math"),
+            "__builtins__": __builtins__ # Required for basic python to work
+        }
+        
+        # 2. Add specific session variables they explicitly NEED
+        if "dataset_path" in st.session_state:
+            safe_globals["dataset_path"] = st.session_state["dataset_path"]
+
+        st.session_state["agent_globals"] = safe_globals
+        
+    # --- 2. SECURITY FIX: STRING GUARDRAILS ---
+    # Even with restricted globals, 'exec' allows imports. We must ban them explicitly.
+    forbidden_terms = ["import os", "import sys", "from os", "from sys", "subprocess", "shutil"]
+    if any(term in code for term in forbidden_terms):
+        sys.stdout = old_out # Reset stdout before returning
+        return "Security Error: Direct system imports (os, sys, subprocess) are not allowed.", None
+        
     try:
+        # Run code in the restricted 'safe_globals' instead of full 'globals()'
         exec(code, st.session_state["agent_globals"])
         
-        # Check if a plot was created
+        # (Rest of your plot capturing logic remains the same)
         if plt.get_fignums():
             plot_buf = io.BytesIO()
             plt.savefig(plot_buf, format='png')
             plot_buf.seek(0)
-            plt.close() # Clear memory
+            plt.close()
+            return new_out.getvalue(), plot_buf
             
-        return new_out.getvalue(), plot_buf
+        return new_out.getvalue(), None
+
     except Exception as e:
         return f"Error: {e}", None
     finally:
