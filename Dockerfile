@@ -5,7 +5,6 @@ FROM python:3.10-slim
 RUN useradd -m -u 1000 user
 
 # Set the working directory to the user's home folder
-# FIXES ERROR #1: Streamlit will now find app.py
 WORKDIR /home/user/app
 
 # Switch to root to install system dependencies
@@ -35,7 +34,6 @@ COPY --chown=user:user . .
 # Expose the port HF Spaces expects
 EXPOSE 7860
 
-# FIXES ERROR #2: Added --server.enableCORS=false and --server.enableXsrfProtection=false
 # This prevents the "AxiosError 403" when uploading files
 CMD ["streamlit", "run", "app.py", \
     "--server.port=7860", \
